@@ -15,6 +15,7 @@ frontend/dist/
 backend/node_modules/
 backend/uploads/
 backend/data/chroma/
+backend/logs/
 
 # Local databases, logs and IDE files
 *.sqlite3

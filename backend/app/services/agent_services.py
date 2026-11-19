@@ -10,6 +10,8 @@ from app.models.user import User
 from app.schemas.ai import ChatRequest
 from app.services import agent_tools
 from app.config import settings
+from app.utils.logger import log_agent_event
+import time
 
 SYSTEM_PROMPT = """你是智能实验室预约系统的 Agent，回答要简洁。
 你可以：
@@ -118,6 +120,10 @@ async def stream_agent(
     """生成器：边跑 Agent 边 yield 事件，供 SSE 推给前端。
     事件类型：status / tool_start / tool_end / token / done / error
     """
+    request_started = time.perf_counter()
+    user_id = getattr(current_user, "id", None)
+    tool_started: dict[str, list[float]] = {}
+    log_agent_event("request_started", user_id=user_id)
     try:
         history = _build_history(data)
         agent = build_agent(db, current_user)
@@ -131,10 +137,13 @@ async def stream_agent(
             version="v2",
             config={"recursion_limit": 10},  # 图执行步数上限，防 agent⇄tools 空转
         ):
-            print("event:", event.get("event"), event.get("name"))
             kind = event.get("event")
             if kind == "on_tool_start":
                 name = event.get("name") or ""
+                tool_started.setdefault(name, []).append(time.perf_counter())
+                log_agent_event(
+                    "tool_started", user_id=user_id, tool=name, status="started"
+                )
                 yield {
                     "type": "tool_start",
                     "name": name,
@@ -142,6 +151,16 @@ async def stream_agent(
                 }
             elif kind == "on_tool_end":
                 name = event.get("name") or ""
+                starts = tool_started.get(name) or []
+                started_at = starts.pop() if starts else None
+                duration_ms = round((time.perf_counter() - started_at) * 1000, 2) if started_at else None
+                log_agent_event(
+                    "tool_finished",
+                    user_id=user_id,
+                    tool=name,
+                    status="success",
+                    duration_ms=duration_ms,
+                )
                 yield {
                     "type": "tool_end",
                     "name": name,
@@ -151,6 +170,20 @@ async def stream_agent(
                         (event.get("data") or {}).get("output")
                     ),
                 }
+            elif kind == "on_tool_error":
+                name = event.get("name") or ""
+                starts = tool_started.get(name) or []
+                started_at = starts.pop() if starts else None
+                duration_ms = round((time.perf_counter() - started_at) * 1000, 2) if started_at else None
+                error = (event.get("data") or {}).get("error")
+                log_agent_event(
+                    "tool_finished",
+                    user_id=user_id,
+                    tool=name,
+                    status="error",
+                    duration_ms=duration_ms,
+                    exception_summary=f"{type(error).__name__}: {error}"[:200],
+                )
             elif kind == "on_chat_model_stream":
                 # 只收 agent 节点的字；其它内部节点的噪声丢掉
                 meta = event.get("metadata") or {}
@@ -160,14 +193,34 @@ async def stream_agent(
                 if text:
                     yield {"type": "token", "content": text}
         # 正常跑完：不要在 done 里再带一份全文，前端已经用 token 拼好了
+        log_agent_event(
+            "request_finished",
+            user_id=user_id,
+            success=True,
+            status="success",
+            duration_ms=round((time.perf_counter() - request_started) * 1000, 2),
+        )
         yield {"type": "done"}
     except BusinessException as exc:
+        log_agent_event(
+            "request_finished",
+            user_id=user_id,
+            success=False,
+            status="business_error",
+            duration_ms=round((time.perf_counter() - request_started) * 1000, 2),
+            exception_summary=str(exc.message)[:200],
+        )
         # 流已经是 SSE，错误也要用 yield，别 raise 成普通 JSON
         yield {"type": "error", "message": exc.message}
-    except Exception:
-        import traceback
-
-        traceback.print_exc()
+    except Exception as exc:
+        log_agent_event(
+            "request_finished",
+            user_id=user_id,
+            success=False,
+            status="error",
+            duration_ms=round((time.perf_counter() - request_started) * 1000, 2),
+            exception_summary=f"{type(exc).__name__}: {str(exc)}"[:200],
+        )
         yield {"type": "error", "message": "大模型调用失败，请稍后重试"}
 
 
